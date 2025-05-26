@@ -40,11 +40,11 @@ def webhook():
             return "Error interno", 500
 
 def generar_respuesta(mensaje):
-    respuesta = openai.ChatCompletion.create(
+    respuesta = client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "user", "content": mensaje}]
     )
-    return respuesta.choices[0].message['content']
+    return respuesta.choices[0].message.content
 
 def enviar_mensaje(recipient_id, mensaje):
     url = f"https://graph.facebook.com/v17.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
