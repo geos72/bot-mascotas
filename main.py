@@ -8,7 +8,9 @@ app = Flask(__name__)
 
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-openai.api_key = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 @app.route('/')
 def home():
@@ -40,11 +42,11 @@ def webhook():
             return "Error interno", 500
 
 def generar_respuesta(mensaje):
-    respuesta = openai.ChatCompletion.create(
+    response = client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[{"role": "user", "content": mensaje}]
     )
-    return respuesta.choices[0].message['content']
+    return response.choices[0].message.content
 
 def enviar_mensaje(recipient_id, mensaje):
     url = f"https://graph.facebook.com/v17.0/me/messages?access_token={PAGE_ACCESS_TOKEN}"
@@ -58,3 +60,4 @@ def enviar_mensaje(recipient_id, mensaje):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
