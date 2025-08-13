@@ -1,216 +1,180 @@
-import os
-import json
-import traceback
 from flask import Flask, request, jsonify
+import os
 import requests
+import traceback
+from datetime import datetime
 
-# OpenAI SDK v1
-from openai import OpenAI
+# === OpenAI SDK (>=1.0) ===
+try:
+    from openai import OpenAI
+except ImportError:
+    # Si alguna vez ves error de import, asegúrate que en requirements.txt tengas: openai>=1.40.0
+    raise
 
 app = Flask(__name__)
 
-PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # puedes cambiarlo a gpt-3.5-turbo si prefieres
+# ==== Config ====
+PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", "")
+VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN", "")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL      = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")  # cámbialo si quieres otro modelo
+IG_BUSINESS_ID    = os.getenv("IG_BUSINESS_ID", "")            # opcional, ayuda a distinguir IG vs Messenger
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-FB_GRAPH_BASE = "https://graph.facebook.com/v19.0/me/messages"
+# ==== Utilidades ====
 
+def log(*args):
+    print(datetime.utcnow().isoformat(), *args, flush=True)
 
-@app.route("/", methods=["GET"])
+def detectar_plataforma(entry_id: str) -> str:
+    """
+    Heurística simple:
+    - Si configuraste IG_BUSINESS_ID y coincide con entry['id'] => 'instagram'
+    - En caso contrario => 'messenger'
+    """
+    if IG_BUSINESS_ID and entry_id == IG_BUSINESS_ID:
+        return "instagram"
+    return "messenger"
+
+def generar_respuesta(user_text: str) -> str:
+    """
+    Llama al modelo de OpenAI y devuelve el texto.
+    """
+    # Prompts mínimos para mantener el costo bajo y respuestas cortas.
+    messages = [
+        {"role": "system", "content": "Eres un asistente de atención para una tienda de mascotas. Responde de forma breve, amable y útil."},
+        {"role": "user", "content": user_text.strip()[:2000]}  # recorta por seguridad
+    ]
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        temperature=0.5,
+        max_tokens=350,
+    )
+    return resp.choices[0].message.content.strip()
+
+def enviar_mensaje(recipient_id: str, texto: str, plataforma: str):
+    """
+    Envía el mensaje via Graph API.
+    Para Instagram hay que poner messaging_product='instagram'.
+    Para Messenger, 'messenger'.
+    """
+    url = "https://graph.facebook.com/v18.0/me/messages"
+    payload = {
+        "recipient": {"id": recipient_id},
+        "message": {"text": texto},
+        "messaging_type": "RESPONSE",
+        "messaging_product": "instagram" if plataforma == "instagram" else "messenger",
+    }
+    headers = {"Content-Type": "application/json"}
+    params = {"access_token": PAGE_ACCESS_TOKEN}
+
+    r = requests.post(url, json=payload, headers=headers, params=params, timeout=20)
+    log(f"➡️  Envío a {plataforma}: {r.status_code} {r.text}")
+
+# ==== Rutas ====
+
+@app.route("/")
 def home():
     return "Bot de Mascotas activo", 200
 
-
-# --- Verificación del webhook de Meta ---
-@app.route("/webhook", methods=["GET"])
-def verify():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        return challenge, 200
-    return "Error de verificación", 403
-
-
-# --- Recepción de eventos ---
-@app.route("/webhook", methods=["POST"])
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook():
+    if request.method == "GET":
+        # Verificación de Webhook (Messenger/Instagram usan el mismo formato)
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        if mode == "subscribe" and token == VERIFY_TOKEN:
+            log("✅ Webhook verificado")
+            return challenge, 200
+        log("❌ Webhook verificación fallida")
+        return "Token inválido", 403
+
+    # POST: eventos
     try:
         data = request.get_json(force=True, silent=True) or {}
-        # LOG opcional
-        print("==> Webhook payload:")
-        print(json.dumps(data, ensure_ascii=False, indent=2))
+        log("📩 Evento recibido:", data)
 
-        # Messenger (object = "page")
-        if data.get("object") == "page":
-            for entry in data.get("entry", []):
-                # Forma típica de Messenger
-                if "messaging" in entry:
-                    handle_messenger_entry(entry)
+        for entry in data.get("entry", []):
+            entry_id = entry.get("id", "")
+            plataforma = detectar_plataforma(entry_id)
 
-                # Por compatibilidad: algunos IG eventos también llegan aquí con changes
-                if "changes" in entry:
-                    handle_instagram_changes(entry)
+            # Para Messenger/Instagram, los eventos vienen en entry['messaging']
+            for messaging_event in entry.get("messaging", []):
+                # Ignora echos y otros tipos
+                if "message" not in messaging_event:
+                    continue
+                if messaging_event["message"].get("is_echo"):
+                    continue
 
-        # Instagram (algunas integraciones pueden marcar object="instagram")
-        elif data.get("object") == "instagram":
-            for entry in data.get("entry", []):
-                # IG puede venir como "messaging" (parecido a Messenger) o como "changes"
-                if "messaging" in entry:
-                    handle_instagram_messaging(entry)
-                if "changes" in entry:
-                    handle_instagram_changes(entry)
+                sender_id = messaging_event["sender"]["id"]
+                text = messaging_event["message"].get("text", "")
 
+                # Si no hay texto (puede ser adjunto), contesta algo genérico
+                if not text and messaging_event["message"].get("attachments"):
+                    text = "Recibí tu mensaje. ¿Podrías escribirme en texto lo que necesitas?"
+
+                if text:
+                    try:
+                        respuesta = generar_respuesta(text)
+                    except Exception as e:
+                        log("❌ Error generando respuesta OpenAI:", e)
+                        traceback.print_exc()
+                        respuesta = "Ahora mismo tengo un problemita técnico. ¿Podrías intentar de nuevo en un momento, por favor?"
+
+                    enviar_mensaje(sender_id, respuesta, plataforma)
+
+        # Responder rápido 200 para que Meta no reintente
         return "EVENT_RECEIVED", 200
 
     except Exception as e:
-        print("❌ Error procesando webhook:", e)
+        log("❌ Error procesando webhook:", e)
         traceback.print_exc()
+        # Aun con error, devolver 200 evita reintentos agresivos; usa 500 si quieres que Meta reintente.
+        return "OK", 200
+
+# ==== Requisitos de Instagram: desautorización y eliminación de datos ====
+
+@app.route("/deauthorize", methods=["POST"])
+def deauthorize():
+    """
+    Meta llama aquí cuando el usuario desautoriza la app.
+    """
+    try:
+        data = request.form.to_dict()
+        log("🔴 Desautorización IG:", data)
+        # TODO: elimina datos de ese usuario en tu BD si guardas algo
+        return "Usuario desautorizado", 200
+    except Exception as e:
+        log("❌ Error en /deauthorize:", e)
         return "Error", 500
 
-
-# -------------------------
-#       HANDLERS
-# -------------------------
-
-def handle_messenger_entry(entry):
-    """Procesa eventos tradicionales de Facebook Messenger."""
-    for evt in entry.get("messaging", []):
-        if "message" in evt and "text" in evt["message"]:
-            sender_id = evt["sender"]["id"]
-            user_text = evt["message"]["text"]
-            reply_and_send(sender_id, user_text, product="messenger")
-
-
-def handle_instagram_messaging(entry):
+@app.route("/delete-data", methods=["GET", "POST"])
+def delete_data():
     """
-    Algunos eventos de Instagram llegan en entry['messaging'] con
-    'messaging_product': 'instagram'.
-    """
-    for evt in entry.get("messaging", []):
-        product = evt.get("messaging_product")
-        if product == "instagram" and "message" in evt and "text" in evt["message"]:
-            sender_id = evt["sender"]["id"]
-            user_text = evt["message"]["text"]
-            reply_and_send(sender_id, user_text, product="instagram")
-
-
-def handle_instagram_changes(entry):
-    """
-    Otros eventos de Instagram llegan en entry['changes'][*]['value'] con:
-      value.messaging_product == 'instagram'
-      value.messages -> lista de mensajes
-      value.from.id -> remitente
-    """
-    for change in entry.get("changes", []):
-        value = change.get("value", {})
-        if value.get("messaging_product") == "instagram":
-            msgs = value.get("messages", [])
-            sender_id = None
-
-            # intentamos detectar el sender en diferentes campos
-            frm = value.get("from") or value.get("sender") or {}
-            if isinstance(frm, dict):
-                sender_id = frm.get("id")
-
-            for m in msgs:
-                # 'text' puede venir como dict {'body': '...'} o como str '...'
-                text = (
-                    (m.get("text") or {}).get("body")
-                    if isinstance(m.get("text"), dict)
-                    else m.get("text")
-                )
-                if not text:
-                    text = m.get("message")  # fallback
-
-                if sender_id and text:
-                    reply_and_send(sender_id, text, product="instagram")
-
-
-# -------------------------
-#   CORE: OpenAI & FB/IG
-# -------------------------
-
-def reply_and_send(recipient_id: str, user_text: str, product: str):
-    """
-    Llama a OpenAI para generar respuesta y la envía por Graph.
-    product: 'messenger' o 'instagram'
+    Meta llama aquí cuando el usuario solicita eliminación de datos.
     """
     try:
-        ai_text = generate_reply(user_text)
+        if request.method == "GET":
+            data = request.args.to_dict()
+        else:
+            data = request.form.to_dict()
+
+        log("🗑 Solicitud de eliminación de datos IG:", data)
+        # TODO: elimina datos en tu BD si guardas algo
+
+        # Respuesta con información de confirmación (formato sugerido por Meta)
+        return jsonify({
+            "url": "https://bot-mascotas.onrender.com",   # puedes poner una página tuya de confirmación
+            "confirmation_code": "datos_eliminados"
+        }), 200
     except Exception as e:
-        print("❌ Error con OpenAI:", e)
-        ai_text = (
-            "Lo siento, ahora mismo tengo mucha carga. ¿Puedes repetir tu pregunta "
-            "en unos segundos?"
-        )
+        log("❌ Error en /delete-data:", e)
+        return "Error", 500
 
-    try:
-        send_fb_message(recipient_id, ai_text, product=product)
-    except Exception as e:
-        print(f"❌ Error enviando mensaje a {product}:", e)
-
-
-def generate_reply(prompt: str) -> str:
-    """
-    Usa el SDK v1 de OpenAI (chat.completions).
-    """
-    try:
-        completion = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Eres un asistente amable para una tienda de mascotas. "
-                        "Responde en español de manera breve y útil."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.6,
-            max_tokens=300,
-        )
-        return completion.choices[0].message.content.strip()
-    except Exception as e:
-        # Manejo específico de cuota/429
-        msg = str(e)
-        if "insufficient_quota" in msg or "429" in msg:
-            return (
-                "Ahora mismo no puedo consultar el motor de IA por límite de uso. "
-                "Intentémoslo de nuevo en un momento, por favor."
-            )
-        raise
-
-
-def send_fb_message(recipient_id: str, text: str, product: str = "messenger"):
-    """
-    Envía el mensaje usando Graph. Para Instagram hay que incluir
-    'messaging_product': 'instagram'.
-    """
-    payload = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": text},
-        "messaging_type": "RESPONSE",
-    }
-
-    if product == "instagram":
-        payload["messaging_product"] = "instagram"
-
-    params = {"access_token": PAGE_ACCESS_TOKEN}
-    headers = {"Content-Type": "application/json"}
-
-    r = requests.post(FB_GRAPH_BASE, params=params, json=payload, headers=headers, timeout=15)
-    print(f"➡️ Enviado a {product}: {r.status_code} {r.text}")
-    r.raise_for_status()
-
-
-# -------------------------
-#        RUN (Render)
-# -------------------------
+# ==== Arranque ====
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
