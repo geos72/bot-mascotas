@@ -1,185 +1,367 @@
-from flask import Flask, request, jsonify
 import os
-import requests
+import json
+import sqlite3
+import smtplib
 import traceback
-from datetime import datetime
+from email.mime.text import MIMEText
+from email.utils import formataddr
+from datetime import datetime, timedelta
 
-# === OpenAI SDK (>=1.0) ===
+from flask import Flask, request, jsonify
+import requests
+
+# ====== OpenAI (cliente moderno) ======
 try:
     from openai import OpenAI
-except ImportError:
-    # Si alguna vez ves error de import, asegúrate que en requirements.txt tengas: openai>=1.40.0
-    raise
+    oai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+except Exception:
+    oai = None
 
 app = Flask(__name__)
 
-# ==== Config ====
-PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", "")
-VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN", "")
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL      = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")  # cámbialo si quieres otro modelo
-IG_BUSINESS_ID    = os.getenv("IG_BUSINESS_ID", "")            # opcional, ayuda a distinguir IG vs Messenger
+PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
+VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN")
+BUSINESS_IG_ID    = os.getenv("BUSINESS_IG_ID")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+SUPPORT_EMAIL_TO = os.getenv("SUPPORT_EMAIL_TO")
 
-# ==== Utilidades ====
+GRAPH = "https://graph.facebook.com/v19.0"
 
-def log(*args):
-    print(datetime.utcnow().isoformat(), *args, flush=True)
+# --------- Utilidades DB (memoria) ----------
+DB_PATH = "state.db"
 
-def detectar_plataforma(entry_id: str) -> str:
-    """
-    Heurística simple:
-    - Si configuraste IG_BUSINESS_ID y coincide con entry['id'] => 'instagram'
-    - En caso contrario => 'messenger'
-    """
-    if IG_BUSINESS_ID and entry_id == IG_BUSINESS_ID:
-        return "instagram"
-    return "messenger"
+def db_init():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS memory (
+        user_id TEXT PRIMARY KEY,
+        last_updated TEXT,
+        context TEXT
+    );
+    """)
+    conn.commit()
+    conn.close()
 
-def generar_respuesta(user_text: str) -> str:
-    """
-    Llama al modelo de OpenAI y devuelve el texto.
-    """
-    # Prompts mínimos para mantener el costo bajo y respuestas cortas.
-    messages = [
-        {"role": "system", "content": "Eres un asistente de atención para una tienda de mascotas. Responde de forma breve, amable y útil."},
-        {"role": "user", "content": user_text.strip()[:2000]}  # recorta por seguridad
-    ]
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=messages,
-        temperature=0.5,
-        max_tokens=350,
-    )
-    return resp.choices[0].message.content.strip()
+def get_context(user_id, max_minutes=120):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT last_updated, context FROM memory WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return []
+    last, ctx = row
+    try:
+        last_dt = datetime.fromisoformat(last)
+        if datetime.utcnow() - last_dt > timedelta(minutes=max_minutes):
+            return []
+    except Exception:
+        return []
+    try:
+        return json.loads(ctx)
+    except Exception:
+        return []
 
-def enviar_mensaje(recipient_id: str, texto: str, plataforma: str):
-    """
-    Envía el mensaje via Graph API.
-    Para Instagram hay que poner messaging_product='instagram'.
-    Para Messenger, 'messenger'.
-    """
-    url = "https://graph.facebook.com/v18.0/me/messages"
-    payload = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": texto},
-        "messaging_type": "RESPONSE",
-        "messaging_product": "instagram" if plataforma == "instagram" else "messenger",
-    }
+def save_context(user_id, messages):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("REPLACE INTO memory(user_id,last_updated,context) VALUES (?,?,?)",
+              (user_id, datetime.utcnow().isoformat(), json.dumps(messages)))
+    conn.commit()
+    conn.close()
+
+db_init()
+
+# --------- Carga catálogo ----------
+def load_products():
+    try:
+        with open("products.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+PRODUCTS = load_products()
+
+def search_products(query):
+    q = query.lower()
+    hits = []
+    for p in PRODUCTS:
+        texto = f"{p.get('nombre','')} {p.get('categoria','')} {p.get('descripcion','')}".lower()
+        if q in texto:
+            hits.append(p)
+        if len(hits) >= 5:
+            break
+    return hits
+
+# --------- Envío de mensajes Facebook/IG ----------
+def send_fb(url, payload):
     headers = {"Content-Type": "application/json"}
-    params = {"access_token": PAGE_ACCESS_TOKEN}
+    r = requests.post(url, json=payload, headers=headers, timeout=20)
+    return r
 
-    r = requests.post(url, json=payload, headers=headers, params=params, timeout=20)
-    log(f"➡️  Envío a {plataforma}: {r.status_code} {r.text}")
+def send_text_psid(psid, text):
+    url = f"{GRAPH}/me/messages?access_token={PAGE_ACCESS_TOKEN}"
+    payload = {
+        "recipient": {"id": psid},
+        "message": {"text": text}
+    }
+    return send_fb(url, payload)
 
-# ==== Rutas ====
+def send_image_psid(psid, image_url):
+    url = f"{GRAPH}/me/messages?access_token={PAGE_ACCESS_TOKEN}"
+    payload = {
+        "recipient": {"id": psid},
+        "message": {
+            "attachment": {
+                "type": "image",
+                "payload": {"url": image_url, "is_reusable": True}
+            }
+        }
+    }
+    return send_fb(url, payload)
 
+def send_quick_replies(psid, text, replies):
+    url = f"{GRAPH}/me/messages?access_token={PAGE_ACCESS_TOKEN}"
+    payload = {
+        "recipient": {"id": psid},
+        "message": {
+            "text": text,
+            "quick_replies": [
+                {"content_type":"text","title":t,"payload":p} for t,p in replies
+            ]
+        }
+    }
+    return send_fb(url, payload)
+
+def send_buttons(psid, text, buttons):
+    """buttons = [{'type':'postback','title':'Productos','payload':'MENU_PRODUCTOS'}, ...]"""
+    url = f"{GRAPH}/me/messages?access_token={PAGE_ACCESS_TOKEN}"
+    payload = {
+        "recipient": {"id": psid},
+        "message": {
+            "attachment": {
+                "type": "template",
+                "payload": {
+                    "template_type": "button",
+                    "text": text,
+                    "buttons": buttons
+                }
+            }
+        }
+    }
+    return send_fb(url, payload)
+
+# --------- Menú / Get Started / Icebreakers ----------
+def messenger_profile_setup():
+    url = f"{GRAPH}/me/messenger_profile?access_token={PAGE_ACCESS_TOKEN}"
+    data = {
+        "get_started": {"payload": "GET_STARTED"},
+        "greeting": [{"locale": "default", "text": "¡Hola! Soy tu asistente de Pet Plus 🐾"}],
+        "persistent_menu": [{
+            "locale": "default",
+            "composer_input_disabled": False,
+            "call_to_actions": [
+                {"type":"postback","title":"🛍 Productos","payload":"MENU_PRODUCTOS"},
+                {"type":"postback","title":"🕒 Horarios","payload":"MENU_HORARIOS"},
+                {"type":"postback","title":"📍 Ubicación","payload":"MENU_UBICACION"},
+                {"type":"postback","title":"👤 Humano","payload":"MENU_HUMANO"}
+            ]
+        }]
+    }
+    r = requests.post(url, json=data, timeout=20)
+    return r.status_code, r.text
+
+def instagram_icebreakers_setup():
+    # Preguntas frecuentes que aparecen antes del primer mensaje en IG
+    url = f"{GRAPH}/{BUSINESS_IG_ID}/icebreakers?access_token={PAGE_ACCESS_TOKEN}"
+    data = {
+        "ice_breakers": json.dumps([
+            {"question":"Ver productos","payload":"MENU_PRODUCTOS"},
+            {"question":"Horarios","payload":"MENU_HORARIOS"},
+            {"question":"Ubicación","payload":"MENU_UBICACION"},
+            {"question":"Hablar con humano","payload":"MENU_HUMANO"}
+        ])
+    }
+    r = requests.post(url, data=data, timeout=20)
+    return r.status_code, r.text
+
+@app.route("/setup", methods=["POST","GET"])
+def setup():
+    try:
+        s1 = messenger_profile_setup()
+        s2 = instagram_icebreakers_setup()
+        return jsonify({"messenger_profile": s1, "ig_icebreakers": s2})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# --------- Fallback a humano por email ----------
+def send_support_email(subject, body):
+    if not all([SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SUPPORT_EMAIL_TO]):
+        return False, "SMTP no configurado"
+    msg = MIMEText(body, "html", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = formataddr(("Bot Pet Plus", SMTP_USER))
+    msg["To"] = SUPPORT_EMAIL_TO
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(SMTP_USER, [SUPPORT_EMAIL_TO], msg.as_string())
+        return True, "OK"
+    except Exception as e:
+        return False, str(e)
+
+# --------- Lógica del bot ----------
+HELP_TEXT = (
+    "Puedo ayudarte con:\n"
+    "• Productos y precios\n"
+    "• Horarios y ubicación\n"
+    "• Recomendaciones para tu mascota\n\n"
+    "Usa el menú o escribe tu consulta 🐶🐱"
+)
+
+def handle_postback(psid, payload):
+    if payload == "GET_STARTED":
+        send_buttons(psid, "¡Bienvenido a Pet Plus! ¿Qué necesitas hoy?",
+                     [
+                        {"type":"postback","title":"🛍 Productos","payload":"MENU_PRODUCTOS"},
+                        {"type":"postback","title":"🕒 Horarios","payload":"MENU_HORARIOS"},
+                        {"type":"postback","title":"📍 Ubicación","payload":"MENU_UBICACION"}
+                     ])
+    elif payload == "MENU_PRODUCTOS":
+        send_quick_replies(psid, "¿Qué buscas? (ej. alimento, juguete, shampoo)",
+                           [("Alimento","BUSCAR:alimento"),("Juguetes","BUSCAR:juguetes"),("Shampoo","BUSCAR:shampoo")])
+    elif payload == "MENU_HORARIOS":
+        send_text_psid(psid, "Abrimos Lun-Dom 9:00–19:00.")
+    elif payload == "MENU_UBICACION":
+        send_text_psid(psid, "Estamos en Av. Principal 123, Col. Centro. https://maps.google.com/?q=Av+Principal+123")
+    elif payload == "MENU_HUMANO":
+        ok, msg = send_support_email(
+            "Escalado manual desde bot (Instagram/Messenger)",
+            f"<b>PSID:</b> {psid}<br/>El usuario pidió hablar con humano."
+        )
+        send_text_psid(psid, "Listo. Un asesor te contactará pronto. 🙌")
+    elif payload.startswith("BUSCAR:"):
+        term = payload.split(":",1)[1]
+        results = search_products(term)
+        if results:
+            for p in results:
+                line = f"• {p['nombre']} - ${p['precio']}\n{p.get('descripcion','')}"
+                send_text_psid(psid, line)
+                if p.get("imagen"):
+                    send_image_psid(psid, p["imagen"])
+        else:
+            send_text_psid(psid, "No encontré productos con esa búsqueda. Prueba con otra palabra. 😉")
+    else:
+        send_text_psid(psid, HELP_TEXT)
+
+def generate_ai_reply(user_id, text):
+    # recupera memoria
+    context = get_context(user_id)
+    messages = context[-10:]  # limitamos contexto
+    messages.append({"role": "system", "content": "Eres un asistente de tienda de mascotas llamado Pet Plus. Responde breve y útil."})
+    messages.append({"role": "user", "content": text})
+    try:
+        if oai is None:
+            return "Estoy teniendo un detalle con el motor de IA. ¿Puedes intentar de nuevo en un momento?"
+        resp = oai.chat.completions.create(
+            model="gpt-4o-mini",  # cambia aquí el modelo si lo deseas
+            messages=messages,
+            temperature=0.3
+        )
+        reply = resp.choices[0].message.content.strip()
+        # actualiza memoria
+        messages.append({"role":"assistant","content":reply})
+        save_context(user_id, messages[-20:])
+        return reply
+    except Exception:
+        traceback.print_exc()
+        return "Ahora mismo no puedo pensar 😅. Intento de nuevo enseguida."
+
+def handle_text(psid, text):
+    # Comandos rápidos
+    low = text.lower().strip()
+    if low in ("menu","menú"):
+        handle_postback(psid, "GET_STARTED")
+        return
+    if any(k in low for k in ["humano","asesor","agente"]):
+        handle_postback(psid, "MENU_HUMANO")
+        return
+    # búsqueda de productos por palabra clave
+    if any(k in low for k in ["alimento","juguete","shampoo","shampú","arnés","collar"]):
+        res = search_products(low)
+        if res:
+            send_text_psid(psid, "Esto podría interesarte:")
+            for p in res:
+                send_text_psid(psid, f"• {p['nombre']} - ${p['precio']}")
+                if p.get("imagen"): send_image_psid(psid, p["imagen"])
+            return
+    # IA general
+    reply = generate_ai_reply(psid, text)
+    send_text_psid(psid, reply)
+
+def handle_image(psid, image_url):
+    # Si quieres describir la imagen con visión (opcional, según tu plan):
+    # reply = describe_image(image_url)   # función opcional
+    # Por ahora, solo confirmamos recepción
+    send_text_psid(psid, "¡Gracias por la imagen! ¿Deseas que te recomiende un producto relacionado?")
+
+# --------- Rutas ----------
 @app.route("/")
 def home():
-    return "Bot de Mascotas activo", 200
+    return "Bot de Mascotas activo"
 
-@app.route("/webhook", methods=["GET", "POST"])
+@app.route("/webhook", methods=["GET","POST"])
 def webhook():
     if request.method == "GET":
-        # Verificación de Webhook (Messenger/Instagram usan el mismo formato)
-        mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
-        if mode == "subscribe" and token == VERIFY_TOKEN:
-            log("✅ Webhook verificado")
-            return challenge, 200
-        log("❌ Webhook verificación fallida")
+        if token == VERIFY_TOKEN:
+            return challenge
         return "Token inválido", 403
 
-    # POST: eventos
+    data = request.get_json(silent=True) or {}
     try:
-        data = request.get_json(force=True, silent=True) or {}
-        log("📩 Evento recibido:", data)
-
+        # Estructura común para Messenger e Instagram
         for entry in data.get("entry", []):
-            entry_id = entry.get("id", "")
-            plataforma = detectar_plataforma(entry_id)
-
-            # Para Messenger/Instagram, los eventos vienen en entry['messaging']
-            for messaging_event in entry.get("messaging", []):
-                # Ignora echos y otros tipos
-                if "message" not in messaging_event:
-                    continue
-                if messaging_event["message"].get("is_echo"):
+            for msg in entry.get("messaging", []):
+                psid = msg.get("sender", {}).get("id")
+                if not psid: 
                     continue
 
-                sender_id = messaging_event["sender"]["id"]
-                text = messaging_event["message"].get("text", "")
+                # Postbacks (botones / menú / icebreakers)
+                if "postback" in msg:
+                    payload = msg["postback"].get("payload", "")
+                    handle_postback(psid, payload)
+                    continue
 
-                # Si no hay texto (puede ser adjunto), contesta algo genérico
-                if not text and messaging_event["message"].get("attachments"):
-                    text = "Recibí tu mensaje. ¿Podrías escribirme en texto lo que necesitas?"
-
-                if text:
-                    try:
-                        respuesta = generar_respuesta(text)
-                    except Exception as e:
-                        log("❌ Error generando respuesta OpenAI:", e)
-                        traceback.print_exc()
-                        respuesta = "Ahora mismo tengo un problemita técnico. ¿Podrías intentar de nuevo en un momento, por favor?"
-
-                    enviar_mensaje(sender_id, respuesta, plataforma)
-
-        # Responder rápido 200 para que Meta no reintente
+                # Mensajes
+                if "message" in msg:
+                    m = msg["message"]
+                    # Adjuntos (imágenes)
+                    if "attachments" in m:
+                        for att in m["attachments"]:
+                            if att.get("type") == "image":
+                                image_url = att.get("payload", {}).get("url")
+                                if image_url:
+                                    handle_image(psid, image_url)
+                                    break
+                        continue
+                    # Texto
+                    text = m.get("text")
+                    if text:
+                        handle_text(psid, text)
         return "EVENT_RECEIVED", 200
-
     except Exception as e:
-        log("❌ Error procesando webhook:", e)
+        print("❌ Error procesando webhook:", e)
         traceback.print_exc()
-        # Aun con error, devolver 200 evita reintentos agresivos; usa 500 si quieres que Meta reintente.
-        return "OK", 200
-
-# ==== Requisitos de Instagram: desautorización y eliminación de datos ====
-
-@app.route("/deauthorize", methods=["POST"])
-def deauthorize():
-    """
-    Meta llama aquí cuando el usuario desautoriza la app.
-    """
-    try:
-        data = request.form.to_dict()
-        log("🔴 Desautorización IG:", data)
-        # TODO: elimina datos de ese usuario en tu BD si guardas algo
-        return "Usuario desautorizado", 200
-    except Exception as e:
-        log("❌ Error en /deauthorize:", e)
         return "Error", 500
 
-@app.route("/delete-data", methods=["GET", "POST"])
-def delete_data():
-    """
-    Meta llama aquí cuando el usuario solicita eliminación de datos.
-    """
-    try:
-        if request.method == "GET":
-            data = request.args.to_dict()
-        else:
-            data = request.form.to_dict()
-
-        log("🗑 Solicitud de eliminación de datos IG:", data)
-        # TODO: elimina datos en tu BD si guardas algo
-
-        # Respuesta con información de confirmación (formato sugerido por Meta)
-        return jsonify({
-            "url": "https://bot-mascotas.onrender.com",   # puedes poner una página tuya de confirmación
-            "confirmation_code": "datos_eliminados"
-        }), 200
-    except Exception as e:
-        log("❌ Error en /delete-data:", e)
-        return "Error", 500
-
-# ==== Arranque ====
-
+# ---------- Arranque ----------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-
-
-
-
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
