@@ -1,158 +1,221 @@
-# main.py
 import os
-import logging
+import json
+import traceback
 from flask import Flask, request, jsonify
 import requests
 
-# --- OpenAI SDK moderno (>=1.0) ---
+# OpenAI SDK v1
 from openai import OpenAI
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
 
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # puedes cambiarlo a gpt-3.5-turbo si prefieres
 
-GRAPH_URL = "https://graph.facebook.com/v17.0/me/messages"
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-@app.route("/")
+FB_GRAPH_BASE = "https://graph.facebook.com/v19.0/me/messages"
+
+
+@app.route("/", methods=["GET"])
 def home():
-    return "Bot activo para Messenger + Instagram", 200
+    return "Bot de Mascotas activo", 200
 
-# ---------- Webhook (verificación + recepción) ----------
-@app.route("/webhook", methods=["GET", "POST"])
+
+# --- Verificación del webhook de Meta ---
+@app.route("/webhook", methods=["GET"])
+def verify():
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+
+    if mode == "subscribe" and token == VERIFY_TOKEN:
+        return challenge, 200
+    return "Error de verificación", 403
+
+
+# --- Recepción de eventos ---
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    if request.method == "GET":
-        # Verificación de Meta
-        mode = request.args.get("hub.mode")
-        token = request.args.get("hub.verify_token")
-        challenge = request.args.get("hub.challenge")
-
-        if mode == "subscribe" and token == VERIFY_TOKEN:
-            logging.info("✅ Webhook verificado correctamente")
-            return challenge, 200
-        logging.warning("❌ Verificación fallida")
-        return "Token inválido", 403
-
-    # POST: eventos
     try:
-        data = request.get_json(silent=True, force=True) or {}
-        # Estructura estándar: { "object": "...", "entry": [ { "messaging": [...] } ] }
-        for entry in data.get("entry", []):
-            for event in entry.get("messaging", []):
-                handle_event(event)
+        data = request.get_json(force=True, silent=True) or {}
+        # LOG opcional
+        print("==> Webhook payload:")
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+
+        # Messenger (object = "page")
+        if data.get("object") == "page":
+            for entry in data.get("entry", []):
+                # Forma típica de Messenger
+                if "messaging" in entry:
+                    handle_messenger_entry(entry)
+
+                # Por compatibilidad: algunos IG eventos también llegan aquí con changes
+                if "changes" in entry:
+                    handle_instagram_changes(entry)
+
+        # Instagram (algunas integraciones pueden marcar object="instagram")
+        elif data.get("object") == "instagram":
+            for entry in data.get("entry", []):
+                # IG puede venir como "messaging" (parecido a Messenger) o como "changes"
+                if "messaging" in entry:
+                    handle_instagram_messaging(entry)
+                if "changes" in entry:
+                    handle_instagram_changes(entry)
+
+        return "EVENT_RECEIVED", 200
+
     except Exception as e:
-        logging.exception(f"❌ Error procesando POST /webhook: {e}")
-        # Siempre devolver 200 para que Meta no reintente infinitamente en caso de errores puntuales
-        return "EVENT_RECEIVED_WITH_ERRORS", 200
-
-    return "EVENT_RECEIVED", 200
+        print("❌ Error procesando webhook:", e)
+        traceback.print_exc()
+        return "Error", 500
 
 
-# ---------- Procesar cada evento ----------
-def handle_event(event: dict):
-    sender_id = event.get("sender", {}).get("id")
-    if not sender_id:
-        return
+# -------------------------
+#       HANDLERS
+# -------------------------
 
-    # Platform puede venir en el propio evento
-    platform = event.get("messaging_product") or infer_platform(event)
-    # Texto del usuario (o postback title como fallback)
-    user_text = extract_text(event)
+def handle_messenger_entry(entry):
+    """Procesa eventos tradicionales de Facebook Messenger."""
+    for evt in entry.get("messaging", []):
+        if "message" in evt and "text" in evt["message"]:
+            sender_id = evt["sender"]["id"]
+            user_text = evt["message"]["text"]
+            reply_and_send(sender_id, user_text, product="messenger")
 
-    logging.info(f"📩 From {platform} | sender: {sender_id} | text: {user_text!r}")
 
-    if not user_text:
-        # Si no hay texto (puede ser adjunto/imagen), responde algo simple
-        send_message(sender_id, "Gracias por tu mensaje 😊 ¿Cómo puedo ayudarte?", platform)
-        return
+def handle_instagram_messaging(entry):
+    """
+    Algunos eventos de Instagram llegan en entry['messaging'] con
+    'messaging_product': 'instagram'.
+    """
+    for evt in entry.get("messaging", []):
+        product = evt.get("messaging_product")
+        if product == "instagram" and "message" in evt and "text" in evt["message"]:
+            sender_id = evt["sender"]["id"]
+            user_text = evt["message"]["text"]
+            reply_and_send(sender_id, user_text, product="instagram")
 
-    # ---- Llama a OpenAI ----
+
+def handle_instagram_changes(entry):
+    """
+    Otros eventos de Instagram llegan en entry['changes'][*]['value'] con:
+      value.messaging_product == 'instagram'
+      value.messages -> lista de mensajes
+      value.from.id -> remitente
+    """
+    for change in entry.get("changes", []):
+        value = change.get("value", {})
+        if value.get("messaging_product") == "instagram":
+            msgs = value.get("messages", [])
+            sender_id = None
+
+            # intentamos detectar el sender en diferentes campos
+            frm = value.get("from") or value.get("sender") or {}
+            if isinstance(frm, dict):
+                sender_id = frm.get("id")
+
+            for m in msgs:
+                # 'text' puede venir como dict {'body': '...'} o como str '...'
+                text = (
+                    (m.get("text") or {}).get("body")
+                    if isinstance(m.get("text"), dict)
+                    else m.get("text")
+                )
+                if not text:
+                    text = m.get("message")  # fallback
+
+                if sender_id and text:
+                    reply_and_send(sender_id, text, product="instagram")
+
+
+# -------------------------
+#   CORE: OpenAI & FB/IG
+# -------------------------
+
+def reply_and_send(recipient_id: str, user_text: str, product: str):
+    """
+    Llama a OpenAI para generar respuesta y la envía por Graph.
+    product: 'messenger' o 'instagram'
+    """
     try:
-        ai = client.chat.completions.create(
-            model="gpt-3.5-turbo",  # puedes cambiar a "gpt-4o-mini" si lo prefieres
+        ai_text = generate_reply(user_text)
+    except Exception as e:
+        print("❌ Error con OpenAI:", e)
+        ai_text = (
+            "Lo siento, ahora mismo tengo mucha carga. ¿Puedes repetir tu pregunta "
+            "en unos segundos?"
+        )
+
+    try:
+        send_fb_message(recipient_id, ai_text, product=product)
+    except Exception as e:
+        print(f"❌ Error enviando mensaje a {product}:", e)
+
+
+def generate_reply(prompt: str) -> str:
+    """
+    Usa el SDK v1 de OpenAI (chat.completions).
+    """
+    try:
+        completion = client.chat.completions.create(
+            model=OPENAI_MODEL,
             messages=[
                 {
                     "role": "system",
                     "content": (
                         "Eres un asistente amable para una tienda de mascotas. "
-                        "Responde breve, claro y útil. Si preguntan por servicios, "
-                        "productos, horarios o ubicación, ofrece detalles concretos."
+                        "Responde en español de manera breve y útil."
                     ),
                 },
-                {"role": "user", "content": user_text},
+                {"role": "user", "content": prompt},
             ],
-            temperature=0.4,
+            temperature=0.6,
             max_tokens=300,
         )
-        reply_text = ai.choices[0].message.content.strip()
+        return completion.choices[0].message.content.strip()
     except Exception as e:
-        logging.exception(f"❌ Error llamando a OpenAI: {e}")
-        reply_text = "Perdón, tuve un problema generando la respuesta. ¿Podrías repetirlo?"
-
-    # ---- Responder por la plataforma correcta ----
-    send_message(sender_id, reply_text, platform)
-
-
-def extract_text(event: dict) -> str:
-    """Obtiene texto del evento (mensaje o postback)."""
-    msg = event.get("message", {})
-    if "text" in msg:
-        return msg["text"]
-    # Quick replies
-    qr = msg.get("quick_reply", {})
-    if "payload" in qr:
-        return str(qr["payload"])
-    # Postbacks (botones)
-    postback = event.get("postback", {})
-    if "title" in postback:
-        return str(postback["title"])
-    if "payload" in postback:
-        return str(postback["payload"])
-    return ""
+        # Manejo específico de cuota/429
+        msg = str(e)
+        if "insufficient_quota" in msg or "429" in msg:
+            return (
+                "Ahora mismo no puedo consultar el motor de IA por límite de uso. "
+                "Intentémoslo de nuevo en un momento, por favor."
+            )
+        raise
 
 
-def infer_platform(event: dict) -> str:
+def send_fb_message(recipient_id: str, text: str, product: str = "messenger"):
     """
-    Si Meta no manda 'messaging_product', inferimos:
-    - Instagram: suele mandarlo, pero por si acaso… comprobamos algunos indicios.
-    Por defecto devolvemos 'messenger'.
-    """
-    # Meta suele incluir 'messaging_product' = 'instagram'/'messenger'.
-    # Si no está, asumimos messenger para mantener compatibilidad.
-    return "messenger"
-
-
-def send_message(psid: str, text: str, platform: str):
-    """
-    Envía el mensaje usando Graph API.
-    Para Instagram es OBLIGATORIO incluir "messaging_product": "instagram".
-    Para Messenger también lo ponemos (es válido y explícito).
+    Envía el mensaje usando Graph. Para Instagram hay que incluir
+    'messaging_product': 'instagram'.
     """
     payload = {
-        "messaging_product": "instagram" if platform == "instagram" else "messenger",
-        "recipient": {"id": psid},
+        "recipient": {"id": recipient_id},
         "message": {"text": text},
+        "messaging_type": "RESPONSE",
     }
+
+    if product == "instagram":
+        payload["messaging_product"] = "instagram"
+
+    params = {"access_token": PAGE_ACCESS_TOKEN}
     headers = {"Content-Type": "application/json"}
 
-    try:
-        r = requests.post(
-            GRAPH_URL,
-            params={"access_token": PAGE_ACCESS_TOKEN},
-            json=payload,
-            headers=headers,
-            timeout=15,
-        )
-        logging.info(f"➡️  Enviado ({platform}) {r.status_code}: {r.text}")
-    except Exception as e:
-        logging.exception(f"❌ Error enviando a {platform}: {e}")
+    r = requests.post(FB_GRAPH_BASE, params=params, json=payload, headers=headers, timeout=15)
+    print(f"➡️ Enviado a {product}: {r.status_code} {r.text}")
+    r.raise_for_status()
 
 
-# ---------- Run ----------
+# -------------------------
+#        RUN (Render)
+# -------------------------
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+
 
 
