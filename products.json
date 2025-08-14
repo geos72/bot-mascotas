@@ -1,0 +1,45 @@
+[
+  {
+    "sku": "Rascador_magico01",
+    "nombre": "Rascador magico con catnip",
+    "precio": {
+      "unidad": 85,
+      "dos_unidades": 150
+    },
+    "keywords": ["rascador", "catnip", "bola de carton"],
+    "imagen": "https://tusitio.com/ruta-a-la-imagen.jpg",
+    "descripcion": "Rascador mágico con catnip para gatos 🐈🐱\nPrecio Uno por Q85\Dos por Q150\n🐾 Material de cartón multicapas para mayor resistencia\n🐾 Inlcuye catnip y bola con cascabeles que se coloca dentro del rascador para atraer a tu michi\n🐾 Para crear el acordeón se juntan las puntas con imanes, se pueden unir dos rascadores si deseas\n🐾 Evita que rasquen tus muebles o ropa\n🚚 Enviamos a domicilio a todo el país\n💵💳 Pago contra entrega en efectivo o con tarjeta de crédito y débito por visa link"
+  },
+  {
+    "sku": "Pinguino01",
+    "nombre": "Pingüino rodador",
+    "precio": {
+      "unidad": 80,
+      "dos_unidades": 140
+    },
+    "keywords": ["pingüino", "pinguino", "rodillo", "cepillo", "quita pelos"],
+    "imagen": "https://tusitio.com/ruta-a-la-imagen2.jpg",
+    "descripcion": "Pingüino rodador para eliminar pelos de ropa y muebles 🐈🐱🐕🐶\nPrecio Uno por Q80\Dos por Q140\n🐾 Fácil de llevar a todas partes\n🐾 No requiere cambios o repuestos, solamente lavas con agua y puedes seguir usándolo\n🐾 Ideal para ropa, muebles o sábanas\n🚚 Enviamos a domicilio a todo el país\n💵💳 Pago contra entrega en efectivo o con tarjeta de crédito y débito por visa link"
+
+
+
+  {
+    "sku": "Bola_interactiva01",
+    "nombre": "Bola interactiva",
+    "precio": Q115,
+    "keywords": ["juguete", "interactivo", "bola", "interactiva", "pelota"],
+    "imagen": "https://tusitio.com/img/mordedera.jpg"
+    },
+  {
+    "sku": "Guantes_humedos01",
+    "nombre": "Guantes húmedos",
+    "precio": 12 x Q70, 24 x Q120, 48 x Q180.
+    "keywords": ["guantes", "húmedos", "limpieza", "toallas", "bañar"],
+    "imagen": "https://tusitio.com/img/mordedera.jpg"
+    },
+  {
+    "sku": "Cepillo_maguito",
+    "nombre": "Manguito vaporizador",
+    "precio": 1x Q60, 2 x Q99,
+    "keywords": ["cepillo", "vaporizador", "vapor", "manguito"],
+    "imagen": "https://tusitio.com/img/mordedera.jpg"
