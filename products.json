@@ -20,26 +20,38 @@
     "keywords": ["pingüino", "pinguino", "rodillo", "cepillo", "quita pelos"],
     "imagen": "https://tusitio.com/ruta-a-la-imagen2.jpg",
     "descripcion": "Pingüino rodador para eliminar pelos de ropa y muebles 🐈🐱🐕🐶\nPrecio Uno por Q80\Dos por Q140\n🐾 Fácil de llevar a todas partes\n🐾 No requiere cambios o repuestos, solamente lavas con agua y puedes seguir usándolo\n🐾 Ideal para ropa, muebles o sábanas\n🚚 Enviamos a domicilio a todo el país\n💵💳 Pago contra entrega en efectivo o con tarjeta de crédito y débito por visa link"
-
-
-
+  },
   {
     "sku": "Bola_interactiva01",
-    "nombre": "Bola interactiva",
-    "precio": Q115,
-    "keywords": ["juguete", "interactivo", "bola", "interactiva", "pelota"],
-    "imagen": "https://tusitio.com/img/mordedera.jpg"
+    "nombre": "Bola Interactiva",
+    "precio": {
+      "unidad": 115,
     },
+    "keywords": ["bola", "pelota", "interactiva", "juguete"],
+    "imagen": "https://tusitio.com/ruta-a-la-imagen.jpg",
+    "descripcion": "Juguete bola interactiva recargable 🐈🐱\nPrecio Q115\n🐾 Recargable, incluye cable cargador\n🐾 Ideal para gatos y perros pequeños\n🐾 Tres modos de funcionamiento, lento, rapido y aleatorio\n🐾 Material resistente, ideal para la mayoria de superficies\n🚚 Enviamos a domicilio a todo el país\n💵💳 Pago contra entrega en efectivo o con tarjeta de crédito y débito por visa link"
+  },
   {
     "sku": "Guantes_humedos01",
     "nombre": "Guantes húmedos",
-    "precio": 12 x Q70, 24 x Q120, 48 x Q180.
-    "keywords": ["guantes", "húmedos", "limpieza", "toallas", "bañar"],
-    "imagen": "https://tusitio.com/img/mordedera.jpg"
+    "precio": {
+      "12": 70,
+      "24": 120,
+      "48": 180,
     },
+    "keywords": ["guantes", "tollas", "limpieza", "baño", "humedos"],
+    "imagen": "https://tusitio.com/ruta-a-la-imagen2.jpg",
+    "descripcion": "Guantes húmedos para la limpieza de tu mascota 🙀🐕🐈\nOferta\n12xQ70\n24xQ120\n48xQ180\n🐾 Ideal para perros y gatos\n🐾 Sin alcohol y materiales orgánicos para el cuidado de tu mascota\n🐾 Desechables, uso de doble cara\n🐾 Recomendado para baño en seco, post cirugía, problemas de la piel o limpieza rápida de rutina\n🚚 Enviamos a domicilio a todo el país\n💵💳 Pago contra entrega en efectivo o con tarjeta de crédito y débito por visa link"
+ },
   {
-    "sku": "Cepillo_maguito",
+    "sku": "Cepillo_vapor_manguito01",
     "nombre": "Manguito vaporizador",
-    "precio": 1x Q60, 2 x Q99,
-    "keywords": ["cepillo", "vaporizador", "vapor", "manguito"],
-    "imagen": "https://tusitio.com/img/mordedera.jpg"
+    "precio": {
+      "unidad": 60,
+      "dos_unidades": 99,
+    },
+    "keywords": ["cepillo", "vapor", "vaporizador", "maguito",],
+    "imagen": "https://tusitio.com/ruta-a-la-imagen2.jpg",
+    "descripcion": "¡Regresaron los manguitos! Cepillo vaporizador para tu mascota 🐈🐕🙀🐶\nUno por Q60\nDos por Q99\n🐾 Ideal para perros y gatos\n🐾 Solo agrega agua o aroma para mascotas\n🐾 Enciende y el cepillo esparce el agua en forma de vapor (no caliente)\n🐾 Ideal para remover exceso de pelo y masajear a tu mascota\n🐾 Cerdas de silicón suave para comodidad de tu mascota\n🐾 Recargable, incluye cable cargador\n🚚 Enviamos a domicilio a todo el país\n💵💳 Pago contra entrega en efectivo o con tarjeta de crédito y débito por visalink"
+  }
+]
