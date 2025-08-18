@@ -1,294 +1,349 @@
+# main.py
 from flask import Flask, request, jsonify
-import os, json, re, time
-import requests
-from collections import deque
-
-# ---------- Config ----------
-PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")   # token de la página
-VERIFY_TOKEN      = os.getenv("VERIFY_TOKEN")
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
-
-# OpenAI (SDK v1.x)
-try:
-    from openai import OpenAI
-    oai = OpenAI(api_key=OPENAI_API_KEY)
-except Exception as e:
-    oai = None
-    print("⚠️ OpenAI SDK no disponible:", e)
+import os, json, re, unicodedata, requests
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-# ---------- Carga de catálogos ----------
-def load_json(filename, default):
+# ======= ENV =======
+PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+
+# ======= CARGA DE CATÁLOGO Y ENVÍOS =======
+def load_json(path, default):
     try:
-        with open(filename, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        print(f"⚠️ No se pudo leer {filename}: {e}")
+        print(f"⚠️ No se pudo leer {path}: {e}")
         return default
 
 PRODUCTS = load_json("products.json", [])
 SHIPPING = load_json("shipping_rules.json", {
-    "city_25_zones": [],
-    "city_30_zones": [],
-    "departments": [],
-    "prices": {"city_25": 25, "city_30": 30, "department": 35}
+    "ciudad_zonas_validas": list(range(1,26)),
+    "costo_zona_normal": 25,
+    "costo_zona_premium": 30,
+    "zonas_premium": [],
+    "costo_departamento": 35,
+    "departamentos_gt": []
 })
 
-# Índice simple para búsqueda por keywords
-def normalize(t): 
-    return re.sub(r"[^a-z0-9áéíóúñ ]","", t.lower())
+# Pre-normaliza catálogo para matching rápido
+def strip_accents(s):
+    return ''.join(c for c in unicodedata.normalize('NFD', s)
+                   if unicodedata.category(c) != 'Mn')
 
-INDEX = []
+def norm(s):
+    if not isinstance(s, str):
+        return ""
+    s = strip_accents(s.lower())
+    s = re.sub(r"[^a-z0-9\s]", " ", s)  # quita puntuación
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+CATALOG = []
 for p in PRODUCTS:
-    keys = set()
-    if "nombre" in p:   keys |= set(normalize(p["nombre"]).split())
-    if "keywords" in p: 
-        for kw in p["keywords"]:
-            keys |= set(normalize(kw).split())
-    INDEX.append({"ref": p, "keys": keys})
+    nombre = p.get("nombre","")
+    kws = p.get("keywords",[])
+    tokens = set(norm(nombre).split())
+    for k in kws:
+        tokens.update(norm(k).split())
+    CATALOG.append({
+        "sku": p.get("sku",""),
+        "nombre": nombre,
+        "nombre_norm": norm(nombre),
+        "tokens": tokens,
+        "precio": p.get("precio",{}),
+        "descripcion": p.get("descripcion",""),
+        "imagen": p.get("imagen","")
+    })
 
-# ---------- Memoria corta por usuario ----------
-# Guarda últimas N interacciones para saludo y contexto simple
-MEMORY = {}  # user_id -> deque([{"role":"user/assistant","content":"..."}])
-MAX_MEMORY = 6
-GREETED   = {}  # user_id -> timestamp de último saludo
+# ======= SESIONES EN MEMORIA =======
+SESSIONS = {}  # sender_id -> {"greeted": bool, "stage": str, "product": dict|None, "last_seen": datetime}
 
-def remember(user_id, role, content):
-    q = MEMORY.setdefault(user_id, deque(maxlen=MAX_MEMORY))
-    q.append({"role": role, "content": content})
+def get_session(user_id):
+    s = SESSIONS.get(user_id)
+    if not s:
+        s = {"greeted": False, "stage": "start", "product": None, "last_seen": datetime.utcnow()}
+        SESSIONS[user_id] = s
+    else:
+        s["last_seen"] = datetime.utcnow()
+    return s
 
-# ---------- Utilidades envío FB/IG ----------
-FB_MSG_URL = "https://graph.facebook.com/v17.0/me/messages"
+# Limpieza básica de sesiones viejas (opcional)
+def cleanup_sessions(max_minutes=120):
+    now = datetime.utcnow()
+    to_del = []
+    for uid, s in SESSIONS.items():
+        if now - s.get("last_seen", now) > timedelta(minutes=max_minutes):
+            to_del.append(uid)
+    for uid in to_del:
+        del SESSIONS[uid]
 
-def send_text(psid, text, messaging_product="facebook"):
+# ======= FB SEND =======
+GRAPH_URL = "https://graph.facebook.com/v17.0/me/messages"
+
+def send_text(recipient_id, text):
     payload = {
-        "recipient": {"id": psid},
-        "message": {"text": text},
-        "messaging_type": "RESPONSE"
+        "recipient": {"id": recipient_id},
+        "message": {"text": text}
     }
-    # Para IG se debe incluir el campo messaging_product
-    if messaging_product == "instagram":
-        payload["messaging_product"] = "instagram"
     r = requests.post(
-        FB_MSG_URL,
+        GRAPH_URL,
         params={"access_token": PAGE_ACCESS_TOKEN},
         json=payload,
-        timeout=15
+        timeout=20
     )
-    if r.status_code >= 400:
-        print("❌ Error FB text:", r.status_code, r.text)
+    print("➡️ FB text:", r.status_code, r.text)
 
-def send_image(psid, image_url, messaging_product="facebook"):
+def send_image(recipient_id, image_url):
+    if not image_url:
+        return
     payload = {
-        "recipient": {"id": psid},
+        "recipient": {"id": recipient_id},
         "message": {
             "attachment": {
                 "type": "image",
                 "payload": {"url": image_url, "is_reusable": True}
             }
-        },
-        "messaging_type": "RESPONSE"
+        }
     }
-    if messaging_product == "instagram":
-        payload["messaging_product"] = "instagram"
     r = requests.post(
-        FB_MSG_URL,
+        GRAPH_URL,
         params={"access_token": PAGE_ACCESS_TOKEN},
         json=payload,
         timeout=20
     )
-    if r.status_code >= 400:
-        print("❌ Error FB image:", r.status_code, r.text)
+    print("➡️ FB image:", r.status_code, r.text)
 
-# ---------- Lógica de dominio ----------
-def find_products_by_text(text):
-    txt = normalize(text)
-    words = set(txt.split())
-    # coincidencias por intersección de keywords
-    scored = []
-    for item in INDEX:
-        score = len(words & item["keys"])
-        if score:
-            scored.append((score, item["ref"]))
-    scored.sort(reverse=True, key=lambda x: x[0])
-    results = [ref for _, ref in scored]
-    # también chequeo por nombre completo incluido
-    for p in PRODUCTS:
-        if normalize(p.get("nombre","")) in txt:
-            if p not in results:
-                results.insert(0, p)
-    return results[:5]
+# ======= INTENCIÓN Y MATCH =======
+PRICE_WORDS = {"precio","cuanto","vale","cuánto","costo","cuesta"}
+IMAGE_WORDS = {"foto","imagen","muestra","ver","enséñame","mostrame"}
+SHIP_WORDS  = {"envio","envío","entrega","mandan","reparto","enviar","llegan","envian"}
+HELP_WORDS  = {"ayuda","informacion","información"}
 
-ZONA_RE = re.compile(r"\bzona\s*(\d{1,2})\b", re.IGNORECASE)
+def detect_intent(text):
+    t = norm(text)
+    words = set(t.split())
+    if words & PRICE_WORDS:
+        return "price"
+    if words & IMAGE_WORDS:
+        return "image"
+    if words & SHIP_WORDS:
+        return "shipping"
+    if words & HELP_WORDS:
+        return "help"
+    return "unknown"
 
-def shipping_quote(text):
-    """Devuelve (monto, motivo) o (None,None) si no encontró."""
-    prices = SHIPPING.get("prices", {})
-    # detectar zona
-    m = ZONA_RE.search(text)
+def find_product(text):
+    t = norm(text)
+    tokens = set(t.split())
+    best = None
+    best_score = 0
+    for p in CATALOG:
+        score = len(tokens & p["tokens"])
+        # Coincidencia fuerte si menciona el nombre normalizado
+        if p["nombre_norm"] in t:
+            score += 3
+        if score > best_score:
+            best = p
+            best_score = score
+    # umbral mínimo: 1 token/keyword o nombre
+    return best if best_score >= 1 else None
+
+# ======= SHIPPING =======
+ZONAS_PREMIUM = {norm(z) for z in SHIPPING.get("zonas_premium", [])}
+DEPTOS = {norm(d) for d in SHIPPING.get("departamentos_gt", [])}
+ZONAS_VALIDAS = set(SHIPPING.get("ciudad_zonas_validas", []))
+COSTO_NORMAL = SHIPPING.get("costo_zona_normal", 25)
+COSTO_PREMIUM = SHIPPING.get("costo_zona_premium", 30)
+COSTO_DEPTO = SHIPPING.get("costo_departamento", 35)
+
+def compute_shipping(user_text):
+    t = norm(user_text)
+    # 1) zona N
+    m = re.search(r"\bzona\s+(\d{1,2})\b", t)
     if m:
         z = int(m.group(1))
-        if z in SHIPPING.get("city_30_zones", []):
-            return prices.get("city_30", 30), f"Zona {z} (tarifa urbana especial)"
-        if z in SHIPPING.get("city_25_zones", []):
-            return prices.get("city_25", 25), f"Zona {z} (tarifa urbana estándar)"
-        # si es una zona 1..25 no listada, asumir estándar
-        if 1 <= z <= 25:
-            return prices.get("city_25", 25), f"Zona {z} (tarifa urbana por defecto)"
-    # detectar departamento
-    txt = normalize(text)
-    for dep in SHIPPING.get("departments", []):
-        if normalize(dep) in txt:
-            return prices.get("department", 35), dep
+        if z in ZONAS_VALIDAS:
+            # premium por nombre de colonia/municipio "complicado"
+            for prem in ZONAS_PREMIUM:
+                if prem in t:
+                    return f"Zona {z} (premium) Q{COSTO_PREMIUM}", COSTO_PREMIUM
+            return f"Zona {z} Q{COSTO_NORMAL}", COSTO_NORMAL
+
+    # 2) Departamento
+    for d in DEPTOS:
+        if d in t:
+            # “Guatemala” puede ser depto o ciudad; si dice "departamento de guatemala" aplicamos depto
+            if "departamento" in t or d != "guatemala":
+                return f"Departamento de {d.title()} Q{COSTO_DEPTO}", COSTO_DEPTO
+
+    # 3) Zonas premium por mención explícita (sin zona)
+    for prem in ZONAS_PREMIUM:
+        if prem in t:
+            return f"{prem.title()} (premium) Q{COSTO_PREMIUM}", COSTO_PREMIUM
+
+    # 4) Si menciona “zona” pero no número, pedirlo
+    if "zona" in t:
+        return "zona_pendiente", None
+
     return None, None
 
-def wants_image(text):
-    return any(w in normalize(text) for w in ["foto","imagen","foto del","ver imagen","ver foto","muestra","muéstrame"])
+# ======= FLUJO =======
+WELCOME = "¡Hola! Bienvenid@ a Pet Plus ¿Cómo podemos ayudarle?"
 
-# ---------- OpenAI fallback ----------
-SYSTEM_PROMPT = (
-    "Eres el asistente de ventas de Pet Plus (accesorios y productos para mascotas en Guatemala). "
-    "Sé claro, corto y útil. Si te preguntan por envíos, solicita zona o departamento. "
-    "Si no estás seguro, pide un dato extra antes de inventar."
-)
+def product_info_text(p):
+    # Descripción y precio SOLO desde catálogo
+    precio = p.get("precio", {})
+    linea_precio = []
+    if "unidad" in precio:
+        linea_precio.append(f"1 x Q{precio['unidad']}")
+    if "dos_unidades" in precio:
+        linea_precio.append(f"2 x Q{precio['dos_unidades']}")
+    precios = " | ".join(linea_precio) if linea_precio else "Precio disponible bajo consulta."
+    desc = p.get("descripcion","")
+    name = p.get("nombre","Producto")
+    txt = f"{name}\n\n{desc}\n\nPrecios: {precios}"
+    return txt.strip()
 
-def llm_reply(history, user_msg):
-    if not oai or not OPENAI_API_KEY:
-        # Respuesta básica si no hay OpenAI disponible
-        return "Gracias por tu mensaje. ¿Podrías darme un poco más de detalle para ayudarte mejor?"
-    msgs = [{"role":"system","content": SYSTEM_PROMPT}]
-    msgs += history[-(MAX_MEMORY-2):]
-    msgs.append({"role":"user","content": user_msg})
-    try:
-        resp = oai.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=msgs,
-            temperature=0.3
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        print("⚠️ OpenAI error:", e)
-        return "Entendido. Déjame confirmar un detalle para ayudarte mejor."
+def handle_message(user_id, text):
+    s = get_session(user_id)
 
-# ---------- Web ----------
-@app.route("/")
-def root():
-    return "Bot de Mascotas activo"
+    # 1) Saludo solo 1 vez al inicio
+    if not s["greeted"]:
+        send_text(user_id, WELCOME)
+        s["greeted"] = True
+        # No retornamos; seguimos interpretando el primer mensaje
 
-@app.route("/webhook", methods=["GET","POST"])
-def webhook():
-    if request.method == "GET":
-        # verificación
-        if request.args.get("hub.verify_token") == VERIFY_TOKEN:
-            return request.args.get("hub.challenge","")
-        return "Token inválido", 403
+    intent = detect_intent(text)
 
-    # POST: eventos
-    data = request.get_json(force=True, silent=True) or {}
-    # print(json.dumps(data, indent=2))  # útil para depurar
-    for entry in data.get("entry", []):
-        for event in entry.get("messaging", []):
-            psid = event.get("sender",{}).get("id")
-            if not psid:
-                continue
-
-            # Detectar si viene de IG o Messenger
-            messaging_product = event.get("message",{}).get("messaging_product") \
-                                or event.get("messaging_product") \
-                                or "facebook"
-            if messaging_product not in ("facebook","instagram"):
-                messaging_product = "facebook"
-
-            # Ignorar echos
-            if event.get("message",{}).get("is_echo"):
-                continue
-
-            text = ""
-            attachments = event.get("message",{}).get("attachments",[])
-            if "message" in event:
-                text = event["message"].get("text","").strip()
-
-            # Saludo automático si no hemos saludado en los últimos 12h
-            now = time.time()
-            if psid not in GREETED or (now - GREETED[psid] > 12*3600):
-                send_text(psid, "¡Hola! Bienvenid@ a Pet Plus ¿Cómo podemos ayudarle?",
-                          messaging_product=messaging_product)
-                GREETED[psid] = now
-
-            if text:
-                handle_text(psid, text, messaging_product)
-            elif attachments:
-                # Por ahora no hacemos visión, guiamos al cliente
-                send_text(psid,
-                          "Recibí tu imagen 👌. Para ubicar el producto más rápido, "
-                          "¿me dices el nombre o alguna palabra clave (ej. “rascador”, “cepillo”, “pingüino”)?",
-                          messaging_product=messaging_product)
-
-    return "EVENT_RECEIVED", 200
-
-def handle_text(psid, text, mp):
-    remember(psid, "user", text)
-
-    # 1) Costo de envío si el texto trae zona/dep
-    price, label = shipping_quote(text)
-    if price is not None:
-        send_text(
-            psid,
-            f"El envío a **{label}** es de **Q{price}**. "
-            "Si me confirmas la dirección y el producto, preparo el total y la entrega. 🚚",
-            messaging_product=mp
-        )
-        remember(psid, "assistant", f"Envío a {label}: Q{price}")
-        return
-
-    # 2) Búsqueda de producto
-    matches = find_products_by_text(text)
-    if matches:
-        # ¿pidió foto?
-        if wants_image(text):
-            prod = matches[0]
-            if prod.get("imagen"):
-                send_image(psid, prod["imagen"], messaging_product=mp)
-            send_text(psid,
-                      f"{prod.get('nombre','Producto')} — {prod.get('precio','')}\n"
-                      f"{prod.get('descripcion','')}".strip(),
-                      messaging_product=mp)
-            remember(psid, "assistant", f"Mostró {prod.get('nombre','')}")
-            return
-
-        # Si hay 1 match: detallo
-        if len(matches) == 1:
-            p = matches[0]
-            lines = [f"**{p.get('nombre','Producto')}**",
-                     p.get("precio",""),
-                     p.get("descripcion","").strip()]
-            msg = "\n".join([l for l in lines if l])
-            send_text(psid, msg, messaging_product=mp)
-            if p.get("imagen"):
-                send_image(psid, p["imagen"], messaging_product=mp)
-            send_text(psid,
-                      "¿Te confirmo disponibilidad y envío? Puedes decirme tu *zona* o *departamento* para el costo de envío.",
-                      messaging_product=mp)
-            remember(psid, "assistant", f"Detalles de {p.get('nombre','')}")
+    # 2) Si aún no hay producto seleccionado, intentamos detectar
+    if s["product"] is None:
+        p = find_product(text)
+        if p:
+            s["product"] = p
+            s["stage"] = "product_selected"
+            send_text(user_id, product_info_text(p))
+            send_text(user_id, "¿Te muestro una foto, deseas el precio o prefieres ver los costos de envío?")
             return
         else:
-            # Varios matches: pedir que elija
-            opciones = [f"- {p.get('nombre','(sin nombre)')}" for p in matches[:5]]
-            send_text(psid,
-                      "Encontré varias opciones similares:\n" + "\n".join(opciones) +
-                      "\n\n¿Sobre cuál te gustaría más info o foto?",
-                      messaging_product=mp)
-            remember(psid, "assistant", "Ofreció lista de coincidencias")
+            # sugerir por keywords
+            # top 3 por coincidencia (reutiliza find_product lógica simple)
+            suggestions = []
+            t = norm(text)
+            toks = set(t.split())
+            scored = []
+            for p in CATALOG:
+                score = len(toks & p["tokens"])
+                if p["nombre_norm"] in t:
+                    score += 3
+                if score > 0:
+                    scored.append((score, p))
+            scored.sort(reverse=True, key=lambda x:x[0])
+            if scored:
+                names = [x[1]["nombre"] for x in scored[:3]]
+                send_text(user_id, "¿Te refieres a alguno de estos?: " + " / ".join(names))
+            else:
+                send_text(user_id, "Cuéntame qué producto buscas (por ejemplo: “rascador”, “guantes húmedos”, “pingüino rodador”).")
             return
 
-    # 3) Fallback con LLM (respuesta general)
-    hist = list(MEMORY.get(psid, []))
-    reply = llm_reply(hist, text)
-    send_text(psid, reply, messaging_product=mp)
-    remember(psid, "assistant", reply)
+    # 3) Con producto seleccionado, resolvemos intención
+    p = s["product"]
 
-# ---------- Run ----------
+    if intent == "image":
+        if p.get("imagen"):
+            send_image(user_id, p["imagen"])
+        else:
+            send_text(user_id, "Aún no tengo imagen cargada para este producto.")
+        return
+
+    if intent == "price":
+        send_text(user_id, product_info_text(p))
+        send_text(user_id, "Si me indicas tu zona o departamento, te digo el costo de envío y te preparo el total. 😊")
+        s["stage"] = "awaiting_shipping"
+        return
+
+    if intent == "shipping" or s["stage"] == "awaiting_shipping":
+        etiqueta, costo = compute_shipping(text)
+        if etiqueta == "zona_pendiente":
+            send_text(user_id, "¿De qué **zona** eres? (por ejemplo: “zona 2”).")
+            s["stage"] = "awaiting_shipping"
+            return
+        if etiqueta and costo is not None:
+            # calcular total si hay precio unitario
+            precio = p.get("precio", {}).get("unidad")
+            if isinstance(precio, (int, float)):
+                total = precio + costo
+                send_text(user_id, f"Envío a **{etiqueta}**. Producto Q{precio} + envío Q{costo} = **Total Q{total}**.\nSi te parece bien, dime tu dirección y nombre para coordinar la entrega. 🧾🚚")
+            else:
+                send_text(user_id, f"Envío a **{etiqueta}**. Si deseas, te confirmo el total cuando me indiques la cantidad que llevarás.")
+            s["stage"] = "closing"
+            return
+        # si no detectó nada
+        send_text(user_id, "Para calcular el envío, ¿podrías indicar **zona** (1–25) o **departamento**?")
+        s["stage"] = "awaiting_shipping"
+        return
+
+    if intent == "help":
+        send_text(user_id, "Puedo ayudarte con información de productos (descripción, foto, precio) y calcular el envío por zona o departamento. 😊")
+        return
+
+    # Si el usuario escribe algo más y ya hay producto:
+    # reforzamos catálogo; no inventamos
+    if "precio" in norm(text):
+        # a veces “unknown” pero menciona precio
+        send_text(user_id, product_info_text(p))
+        send_text(user_id, "¿Te calculo el envío? Dime tu zona (1–25) o departamento.")
+        s["stage"] = "awaiting_shipping"
+        return
+
+    # Pregunta abierta pero ya hay producto
+    send_text(user_id, "¿Quieres que te envíe **foto**, **precio** o calcule **envío** para este producto?")
+    return
+
+# ======= WEB =======
+@app.route("/")
+def home():
+    return "Bot de Mascotas activo"
+
+@app.route('/webhook', methods=['GET', 'POST'])
+def webhook():
+    cleanup_sessions()
+
+    if request.method == 'GET':
+        token = request.args.get('hub.verify_token')
+        challenge = request.args.get('hub.challenge')
+        if token == VERIFY_TOKEN:
+            return challenge
+        return 'Token inválido', 403
+
+    data = request.get_json()
+    try:
+        for entry in data.get('entry', []):
+            for event in entry.get('messaging', []):
+                sender = event['sender']['id']
+                # Mensajes normales
+                if 'message' in event:
+                    msg = event['message']
+                    # ignorar echos/entregas/adjuntos no texto (las imágenes las tratamos como intención "image")
+                    if 'text' in msg:
+                        handle_message(sender, msg['text'])
+                    elif 'attachments' in msg:
+                        # si llega una imagen del cliente, pedimos nombre del producto o adjuntamos flujo
+                        send_text(sender, "Recibí tu imagen 👍. ¿Sobre qué producto necesitas información? (puedes escribir el nombre)")
+                # Postbacks (opcional)
+                if 'postback' in event:
+                    payload = event['postback'].get('payload','')
+                    # Evita que los postbacks generen nuevos saludos múltiples
+                    if payload.lower() in {"get_started","start"}:
+                        sess = get_session(sender)
+                        if not sess["greeted"]:
+                            send_text(sender, WELCOME)
+                            sess["greeted"] = True
+    except Exception as e:
+        print("❌ Error webhook:", e)
+    return "EVENT_RECEIVED", 200
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
