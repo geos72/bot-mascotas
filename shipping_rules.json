@@ -2,7 +2,7 @@
   "ciudad_zonas_validas": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25],
   "costo_zona_normal": 25,
   "costo_zona_premium": 30,
-  "zonas_premium": [ciudad quetzal, amatitlán, san juan sacatepéquez, palencia, chuarrancho, san raymundo, san pedro ayampuc, san jose del golfo],
+  "zonas_premium": ["ciudad quetzal", "amatitlán", "san juan sacatepéquez", "palencia", "chuarrancho", "san raymundo", "san pedro ayampuc", "san jose del golfo"],
 
   "costo_departamento": 35,
   "departamentos_gt": [
